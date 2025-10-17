@@ -84,6 +84,18 @@ python cipherxploit.py picoctf -c "LXFOPVEFRNHR" -k "CRYPTO"
 python cipherxploit.py ctf -c "data" -k "12345"  # Tries as text, numbers, Vigenère key
 ```
 
+### **File Input Support**
+```bash
+# Read ciphertext from file
+python cipherxploit.py picoctf -c cipher.txt
+
+# Read both ciphertext and key from files
+python cipherxploit.py ctf -c cipher.txt -k key.txt
+
+# Mix file and direct input
+python cipherxploit.py picoctf -c cipher.txt -k "MYKEY"
+```
+
 ### **Advanced Options**
 ```bash
 # Custom flag regex
