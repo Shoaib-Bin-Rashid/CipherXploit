@@ -40,9 +40,13 @@ def cBLU(s): return f"{BLUE}{s}{RESET}"
 def eprint(*a, **k): print(*a, file=sys.stderr, **k)
 
 # ---------- Report (CLEAN FILTERED VERSION) ----------
-REPORT_PATH = "report.txt"
+REPORT_PATH = "full_report.txt"
+LAYER1_REPORT_PATH = "layer1_report.txt"
 _report_all: List[Tuple[str, str]] = []
 _report_might: List[Tuple[str, str, str]] = []  # (operation, text, matched_word)
+_layer1_all: List[Tuple[str, str]] = []  # Phase 1 operations for layer1 report
+_layer1_might: List[Tuple[str, str, str]] = []  # Phase 1 meaningful results for layer1 report
+_in_phase1: bool = True  # Track whether we're in Phase 1
 
 COMMON_WORDS = {
     "flag","ctf","capture","challenge","exploit","crypto","cipher","decode","decrypt","encode",
@@ -67,6 +71,10 @@ def printable_only(s: str) -> str:
 def leet_normalize(s: str) -> str:
     """Convert leetspeak to normal for matching."""
     return s.lower().translate(_LEET_TABLE)
+
+# NOTE: Use ONLY for partial-match comparisons (never for exact)
+def _norm_partial(s: str) -> str:
+    return leet_normalize((s or "").strip()).lower()
 
 def _should_save_to_report(data: bytes, threshold: float = 0.4) -> bool:
     """Keep only reasonably printable results."""
@@ -98,9 +106,16 @@ def save_report_entry(operation: str, data: bytes):
     if not printable:
         return
     _report_all.append((operation, printable))
+    # Add to layer1 report only if in Phase 1
+    if _in_phase1:
+        _layer1_all.append((operation, printable))
+    
     match = _find_match_word(printable)
     if match:
         _report_might.append((operation, printable, match))
+        # Add to layer1 meaningful results only if in Phase 1
+        if _in_phase1:
+            _layer1_might.append((operation, printable, match))
 
 def write_report_file(path: str = REPORT_PATH):
     """Write clean report with 'Might make sense' at the top."""
@@ -121,6 +136,31 @@ def write_report_file(path: str = REPORT_PATH):
                 f.write(f"[{op}] {txt}\n")
     except Exception as e:
         print("Failed to write report:", e, file=sys.stderr)
+
+def write_layer1_report_file(path: str = LAYER1_REPORT_PATH):
+    """Write Phase 1 operations report with 'Might make sense' and 'All operations' sections."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            # First section: meaningful Phase 1 results
+            f.write("============================================\n")
+            f.write("               Might make sense\n")
+            f.write("============================================\n\n\n")
+            for op, txt, match in _layer1_might:
+                f.write(f"[{op}] {txt} -- [{match}]\n")
+
+            # Second section: all Phase 1 operations
+            f.write("\n\n\n============================================\n")
+            f.write("            All operations\n")
+            f.write("============================================\n\n\n")
+            for op, txt in _layer1_all:
+                f.write(f"[{op}] {txt}\n")
+    except Exception as e:
+        print("Failed to write layer1 report:", e, file=sys.stderr)
+
+def write_all_reports():
+    """Write both the full report and layer1 operations summary."""
+    write_report_file()
+    write_layer1_report_file()
 
 # ---------- Auto-Detection Engine ----------
 def detect_base64_pattern(data: bytes) -> float:
@@ -456,12 +496,12 @@ def compile_extra_regex(rx: Optional[str]) -> Optional[re.Pattern]:
 def find_flags(blob: bytes, main_re: re.Pattern, extra_re: Optional[re.Pattern], flag_format: str) -> List[Hit]:
     hits: List[Hit] = []
     txt = blob.decode('utf-8', errors='ignore')
-    # 1) exact
+    # 1) exact (UNCHANGED: no leet/case normalization here)
     for m in main_re.finditer(txt):
         hits.append(Hit(m.group(), (m.start(), m.end()), "exact"))
     if hits:
         return hits
-    # 2) case-insensitive full token
+    # 2) case-insensitive full token (UNCHANGED)
     try:
         mci = re.compile(main_re.pattern, re.IGNORECASE)
         for m in mci.finditer(txt):
@@ -470,7 +510,21 @@ def find_flags(blob: bytes, main_re: re.Pattern, extra_re: Optional[re.Pattern],
             return hits
     except re.error:
         pass
-    # 3) loose prefix search
+
+    # 3a) Leet- and case-aware PARTIAL match anywhere (new, partial-only)
+    raw_flag = (flag_format or "").strip()
+    if raw_flag:
+        norm_flag = _norm_partial(raw_flag)
+        norm_txt = _norm_partial(txt)
+        idx = norm_txt.find(norm_flag)
+        if idx != -1:
+            start = idx
+            end = min(idx + len(raw_flag), len(txt))
+            snippet = txt[start:end]
+            hits.append(Hit(snippet, (start, end), "partial"))
+            return hits
+
+    # 3b) Existing loose case-insensitive search (kept for backward compatibility)
     loose = re.compile(re.escape(flag_format), re.IGNORECASE)
     m = loose.search(txt)
     if m:
@@ -486,19 +540,22 @@ def find_flags(blob: bytes, main_re: re.Pattern, extra_re: Optional[re.Pattern],
         else:
             # Enhanced flag reconstruction for cipher outputs
             # Look for pattern: flag_format + content (possibly with padding)
-            flag_upper = flag_format.upper()
-            if txt.upper().startswith(flag_upper):
-                remaining = txt[len(flag_format):]
-                # Remove common cipher padding (X, Z, etc.) from end
-                content = remaining.rstrip('XZ')
-                if content:
-                    # Reconstruct flag with braces
-                    reconstructed = f"{flag_format.lower()}{{{content.lower()}}}"
-                    hits.append(Hit(reconstructed, (0, len(txt)), "partial"))
-                    return hits
+            # Use leet-aware matching for partial matches
+            if raw_flag:  # reuse the normalized flag from above
+                norm_txt_prefix = _norm_partial(txt[:len(raw_flag)] if len(txt) >= len(raw_flag) else txt)
+                if norm_txt_prefix == norm_flag:
+                    remaining = txt[len(flag_format):]
+                    # Remove common cipher padding (X, Z, etc.) from end
+                    content = remaining.rstrip('XZ')
+                    if content:
+                        # Reconstruct flag with braces
+                        reconstructed = f"{flag_format.lower()}{{{content.lower()}}}"
+                        hits.append(Hit(reconstructed, (0, len(txt)), "partial"))
+                        return hits
             hits.append(Hit(m.group(), (m.start(), m.end()), "partial"))
         return hits
-    # 4) extra regex
+
+    # 4) extra regex (UNCHANGED)
     if extra_re:
         for m in extra_re.finditer(txt):
             hits.append(Hit(m.group(), (m.start(), m.end()), "extra"))
@@ -661,11 +718,27 @@ def dec_base64(b: bytes)->List[Result]:
     for p in (0,1,2,3):
         try:
             cand=base64.b64decode(s+b'='*p, validate=False)
-            if cand: outs.append(Result(cand,"base64"))
+            if cand: 
+                outs.append(Result(cand,"base64"))
+                # Also try UTF-16LE decoding for the decoded bytes
+                if len(cand) > 2 and cand[1::2] == b'\x00' * (len(cand)//2):
+                    try:
+                        utf16_decoded = cand.decode('utf-16le')
+                        outs.append(Result(utf16_decoded.encode('utf-8'), "base64(utf16le)"))
+                    except Exception:
+                        pass
         except Exception: pass
     try:
         cand=base64.urlsafe_b64decode(s+b'==')
-        if cand: outs.append(Result(cand,"base64(urlsafe)"))
+        if cand: 
+            outs.append(Result(cand,"base64(urlsafe)"))
+            # Also try UTF-16LE decoding for urlsafe
+            if len(cand) > 2 and cand[1::2] == b'\x00' * (len(cand)//2):
+                try:
+                    utf16_decoded = cand.decode('utf-16le')
+                    outs.append(Result(utf16_decoded.encode('utf-8'), "base64(urlsafe+utf16le)"))
+                except Exception:
+                    pass
     except Exception: pass
     return outs
 
@@ -2243,10 +2316,15 @@ def try_specific_decoder_by_name(data: bytes, method_name: str, key_map: Dict[st
             hits = find_flags(result.data, main_re, extra_re, flag_format)
             if hits:
                 exact = [h for h in hits if h.case == "exact"]
+                partial = [h for h in hits if h.case != "exact"]
                 if exact:
                     for h in exact:
                         print_flag((result.method,), h)
                     return result.data, result.method
+                # Also show partial matches for priority methods
+                elif partial:
+                    for h in partial:
+                        print_partial((result.method,), h, result.data)
         
     except Exception:
         pass  # Failed, continue to next method
@@ -2487,9 +2565,12 @@ def main():
     ap.add_argument("-h","--help", action="help", help="Show this help and exit")
     args = ap.parse_args()
 
-    _report_all.clear(); _report_might.clear()
+    global _in_phase1
+    _report_all.clear(); _report_might.clear(); _layer1_all.clear(); _layer1_might.clear()
+    _in_phase1 = True
     try:
         open(REPORT_PATH, "w", encoding="utf-8").close()
+        open(LAYER1_REPORT_PATH, "w", encoding="utf-8").close()
     except Exception:
         pass
 
@@ -2522,15 +2603,16 @@ def main():
     # Skip multi-layer phases in batch mode
     if batch_mode:
         print(cYEL("Batch mode: Skipping multi-layer analysis. No exact-case flag found in Phase 1."))
-        write_report_file()
-        print(cBLU(f"Report written to {REPORT_PATH}"))
+        write_all_reports()
+        print(cBLU(f"Reports written to {REPORT_PATH} and {LAYER1_REPORT_PATH}"))
         sys.exit(1)
 
+    _in_phase1 = False  # Mark end of Phase 1
     print(cCYN("=== Phase 2: dual-layer combinations ==="))
     win, chain, st2 = run_combo_layers(ctext, main_re, extra_re, key_map, max_depth=2, debug_on=debug_on, phase_name="Phase 2", flag_format=flag_format)
     phase_report_plain("Phase 2", st2)
     if win is not None:
-        write_report_file()
+        write_all_reports()
         sys.exit(0)
 
     allow_triple = input("Try triple-layer combos (can be slow)? (y/N): ").strip().lower().startswith('y')
@@ -2539,7 +2621,7 @@ def main():
         win, chain, st3 = run_combo_layers(ctext, main_re, extra_re, key_map, max_depth=3, debug_on=debug_on, phase_name="Phase 3", flag_format=flag_format)
         phase_report_plain("Phase 3", st3)
         if win is not None:
-            write_report_file()
+            write_all_reports()
             sys.exit(0)
         allow_quad = input("Still nothing. Try quad-layer combos? (y/N): ").strip().lower().startswith('y')
         if allow_quad:
@@ -2547,12 +2629,12 @@ def main():
             win, chain, st4 = run_combo_layers(ctext, main_re, extra_re, key_map, max_depth=4, debug_on=debug_on, phase_name="Phase 4", flag_format=flag_format)
             phase_report_plain("Phase 4", st4)
             if win is not None:
-                write_report_file()
+                write_all_reports()
                 sys.exit(0)
 
     print(cYEL("No exact-case flag found. Review partial matches, adjust (-k/-r), or enable deeper layers."))
-    write_report_file()
-    print(cBLU(f"Report written to {REPORT_PATH}"))
+    write_all_reports()
+    print(cBLU(f"Reports written to {REPORT_PATH} and {LAYER1_REPORT_PATH}"))
     sys.exit(1)
 
 if __name__ == "__main__":
