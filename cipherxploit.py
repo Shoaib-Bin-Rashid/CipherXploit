@@ -19,6 +19,7 @@ import sys
 import urllib.parse
 import zlib
 from dataclasses import dataclass
+from itertools import permutations
 from typing import Callable, List, Optional, Sequence, Tuple, Dict
 
 # ---------- Colors ----------
@@ -727,36 +728,71 @@ def dec_base36(b: bytes) -> List[Result]:
     except Exception:
         return []
 
+
 def dec_base62(b: bytes) -> List[Result]:
-    """Decode base62 (0-9, a-z, A-Z) to bytes."""
+    # blocks and a helper to produce human-readable name
+    DIGITS = "0123456789"
+    UPPER  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    LOWER  = "abcdefghijklmnopqrstuvwxyz"
+    BLOCKS = [DIGITS, UPPER, LOWER]
+    BLOCK_NAMES = {DIGITS: "D", UPPER: "U", LOWER: "L"}
+
+    # decode input bytes to string
     try:
         s = b.decode('utf-8', errors='ignore').strip()
     except Exception:
         s = b.decode('latin1', errors='ignore').strip()
-    
-    base62_chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    clean = ''.join(ch for ch in s if ch in base62_chars)
-    if len(clean) < 2:
-        return []
-    
-    try:
-        # Manual base62 decode
-        num = 0
-        for ch in clean:
-            if '0' <= ch <= '9':
-                num = num * 62 + (ord(ch) - ord('0'))
-            elif 'a' <= ch <= 'z':
-                num = num * 62 + (ord(ch) - ord('a') + 10)
-            elif 'A' <= ch <= 'Z':
-                num = num * 62 + (ord(ch) - ord('A') + 36)
-        
-        hex_str = hex(num)[2:]
-        if len(hex_str) % 2:
-            hex_str = '0' + hex_str
-        out = bytes.fromhex(hex_str)
-        return [Result(out, "base62")]
-    except Exception:
-        return []
+
+    # store decoded results grouped by output bytes
+    decoded_map = {}  # bytes -> set of variant-names
+
+    for perm in permutations(BLOCKS, 3):
+        alphabet = "".join(perm)
+        # name like "DUL", "DLU", etc.
+        name = "".join(BLOCK_NAMES[p] for p in perm)
+
+        # clean input (keep only characters present in this alphabet)
+        clean = ''.join(ch for ch in s if ch in alphabet)
+        if len(clean) < 2:
+            # skip too-short cleaned strings (your original check used <2)
+            continue
+
+        # build fast lookup for values
+        value_of = {ch: idx for idx, ch in enumerate(alphabet)}
+
+        # convert base62 string -> integer
+        try:
+            num = 0
+            for ch in clean:
+                # if character not in alphabet, abort this variant (shouldn't happen due to clean)
+                if ch not in value_of:
+                    raise ValueError("char not in alphabet")
+                num = num * 62 + value_of[ch]
+
+            # integer -> bytes (big-endian), mimic previous behavior (no forced nibble padding)
+            if num == 0:
+                out = b'\x00'
+            else:
+                blen = (num.bit_length() + 7) // 8
+                out = num.to_bytes(blen, 'big')
+
+            # record variant for this output
+            if out in decoded_map:
+                decoded_map[out].add(name)
+            else:
+                decoded_map[out] = {name}
+        except Exception:
+            # ignore this alphabet if it fails
+            continue
+
+    # build Result list: one Result per unique decoded bytes, method lists variants
+    results: List[Result] = []
+    for out_bytes, names in decoded_map.items():
+        variant_tag = "base62:" + ",".join(sorted(names))
+        results.append(Result(out_bytes, variant_tag))
+
+    return results
+
 
 def rot5_numbers(b: bytes) -> List[Result]:
     """ROT5 for numbers (0-9 rotated by 5)."""
